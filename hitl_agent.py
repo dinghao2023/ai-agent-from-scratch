@@ -90,6 +90,8 @@ graph_builder.add_edge(START, "agent")
 graph_builder.add_conditional_edges("agent", tools_condition)
 graph_builder.add_edge("tools", "agent")
 
+# interrupt负责“踩刹车+抛出问题”，checkpointer负责“记住线程 + 暂停恢复”，Command(resume=...)负责“给答案并放行”。
+
 # 关键①：挂上 checkpointer，图从此能"记住线程 + 暂停恢复"
 checkpointer = InMemorySaver()
 graph = graph_builder.compile(checkpointer=checkpointer)

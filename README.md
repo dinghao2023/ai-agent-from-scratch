@@ -1,6 +1,6 @@
 # 从零实现 AI Agent
 
-用 DeepSeek 的对话接口，从「单次工具调用」逐步做到「多步推理 + 联网搜索」，最后用 LangGraph 把同一套循环画成状态图。五个脚本各自独立，可以按顺序阅读和运行。
+用 DeepSeek 的对话接口，从「单次工具调用」逐步做到「多步推理 + 联网搜索」，再用 LangGraph 把循环画成状态图，最后在发邮件前暂停，等人确认后继续。六个脚本各自独立，可以按顺序阅读和运行。
 
 模型通过 OpenAI 兼容接口调用 `deepseek-chat`。算术、时间和搜索由本地函数执行，模型只负责决定何时调用、以及如何根据返回结果组织答案。
 
@@ -13,6 +13,7 @@
 | `react_agent.py` | 多步循环。每轮观察工具结果，再决定继续调用还是给出答案，最多 6 步。 |
 | `search_agent.py` | 在多步循环上增加 DuckDuckGo 搜索，用于新闻和实时信息。 |
 | `langgraph_agent.py` | 用 LangGraph 表达同一套工具循环：`agent` 调模型，`tools` 执行函数，条件边决定继续还是结束。 |
+| `hitl_agent.py` | 在同一张图上增加人工确认。`send_email` 执行前暂停，终端回复「确认」后才继续；同一次运行内用 `thread_id` 记住对话。 |
 
 ## 环境
 
@@ -35,8 +36,9 @@ copy .env.example .env
 | `openai` | 前四个脚本直接请求 DeepSeek |
 | `python-dotenv` | 从 `.env` 读取密钥 |
 | `ddgs` | DuckDuckGo 搜索 |
-| `langchain-openai` | `langgraph_agent.py` 里的 `ChatOpenAI` |
-| `langgraph` | 状态图、`ToolNode`、`tools_condition` |
+| `langchain-openai` | `langgraph_agent.py`、`hitl_agent.py` 里的 `ChatOpenAI` |
+| `langgraph` | 状态图、`ToolNode`、`tools_condition`，以及暂停恢复用的 `InMemorySaver` |
+| `rich` | `hitl_agent.py` 用来打印模型回复 |
 
 ## 运行
 
@@ -46,6 +48,7 @@ python multi_tool.py
 python react_agent.py
 python search_agent.py
 python langgraph_agent.py
+python hitl_agent.py
 ```
 
 启动后在终端输入问题，输入 `q` 退出。
@@ -57,8 +60,9 @@ python langgraph_agent.py
 - `react_agent.py`：`先告诉我现在的时间，再把小时数乘以 60`
 - `search_agent.py`：`今天有什么科技新闻`
 - `langgraph_agent.py`：`查一下今天的科技新闻，再把搜索结果条数乘以 2`
+- `hitl_agent.py`：`帮我给 boss@example.com 发一封邮件，主题是周报，内容是本周工作已完成`
 
-`react_agent.py` 和 `search_agent.py` 会在终端打印每一步调用的工具名、参数和观察结果。搜索结果较长，终端只显示前 200 个字符，完整内容仍会回传给模型。`langgraph_agent.py` 只打印最终回答。
+`react_agent.py` 和 `search_agent.py` 会在终端打印每一步调用的工具名、参数和观察结果。搜索结果较长，终端只显示前 200 个字符，完整内容仍会回传给模型。`langgraph_agent.py` 只打印最终回答。`hitl_agent.py` 在发信前打印确认问题，回复后再打印最终回答。
 
 ## 手写调用流程
 
@@ -98,12 +102,23 @@ flowchart LR
 
 这张图没有 `max_steps`。LangGraph 默认递归上限是 25，超过后会抛错。进入图时只有用户消息，工具选择靠各函数的 docstring。
 
+## 发信前的人工确认
+
+`hitl_agent.py` 的图和 `langgraph_agent.py` 相同，多了三件事：
+
+1. 编译时挂上 `InMemorySaver`。每次调用都带 `thread_id = "thread-1"`，同一轮进程里的对话会追加到这份状态上。进程退出后内存清空，重新运行不会接着上次的对话，停在半路的确认也不会保留。
+2. 第一轮把系统提示和用户消息一起写入状态，要求发邮件时直接调用 `send_email`。之后只追加用户消息。
+3. `send_email` 里调用 `interrupt()`。图停在工具节点，`settle()` 读取 `graph.get_state(config).interrupts`，把收件人、主题和正文打印出来。回复恰好是「确认」时，用 `Command(resume=...)` 从暂停处继续并返回「已发送」；其他内容返回「未发送」。这里没有真正的发信接口。
+
+计算、查时间和搜索不会暂停。确认发生在工具函数内部，模型只要调用了 `send_email` 就会被拦住。
+
 ## 工具
 
 | 名称 | 作用 | 出现在 |
 | --- | --- | --- |
 | `calculator` | 计算数学表达式 | 全部脚本 |
 | `get_current_time` | 返回本地时间，格式 `YYYY-MM-DD HH:MM:SS` | `multi_tool.py` 及之后 |
-| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要 | `search_agent.py`、`langgraph_agent.py` |
+| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要 | `search_agent.py`、`langgraph_agent.py`、`hitl_agent.py` |
+| `send_email` | 模拟发信。执行前暂停，只有回复「确认」才返回已发送 | `hitl_agent.py` |
 
 `calculator` 使用去掉内置函数的 `eval` 计算表达式，只适合本地演示，不要把它暴露给不受信任的输入。
