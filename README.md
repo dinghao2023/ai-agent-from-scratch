@@ -1,6 +1,6 @@
 # 从零实现 AI Agent
 
-用 DeepSeek 的对话接口，从「单次工具调用」逐步做到「多步推理 + 联网搜索」，再用 LangGraph 把循环画成状态图，最后在发邮件前暂停，等人确认后继续。六个脚本各自独立，可以按顺序阅读和运行。
+用 DeepSeek 的对话接口，从「单次工具调用」逐步做到「多步推理 + 联网搜索」，再用 LangGraph 把循环画成状态图，最后在发邮件前暂停，等人确认后继续。前六个脚本各自独立，可以按顺序阅读和运行。`agent_core.py` 把这张图抽成可供导入的模块，`server.py` 用同一张图提供 HTTP 对话和审批。
 
 模型通过 OpenAI 兼容接口调用 `deepseek-chat`。算术、时间和搜索由本地函数执行，模型只负责决定何时调用、以及如何根据返回结果组织答案。
 
@@ -14,6 +14,8 @@
 | `search_agent.py` | 在多步循环上增加 DuckDuckGo 搜索，用于新闻和实时信息。 |
 | `langgraph_agent.py` | 用 LangGraph 表达同一套工具循环：`agent` 调模型，`tools` 执行函数，条件边决定继续还是结束。 |
 | `hitl_agent.py` | 在同一张图上增加人工确认。`send_email` 执行前暂停，终端回复「确认」后才继续；同一次运行内用 `thread_id` 记住对话。 |
+| `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态、`InMemorySaver` 和 `thread_id` 配置集中在这里，进程内只编译一次。 |
+| `server.py` | FastAPI 服务。`POST /chat` 写入用户消息并跑图，`POST /chat/resume` 把审批决定送回暂停点。 |
 
 ## 环境
 
@@ -36,9 +38,11 @@ copy .env.example .env
 | `openai` | 前四个脚本直接请求 DeepSeek |
 | `python-dotenv` | 从 `.env` 读取密钥 |
 | `ddgs` | DuckDuckGo 搜索 |
-| `langchain-openai` | `langgraph_agent.py`、`hitl_agent.py` 里的 `ChatOpenAI` |
+| `langchain-openai` | `langgraph_agent.py`、`hitl_agent.py`、`agent_core.py` 里的 `ChatOpenAI` |
 | `langgraph` | 状态图、`ToolNode`、`tools_condition`，以及暂停恢复用的 `InMemorySaver` |
 | `rich` | `hitl_agent.py` 用来打印模型回复 |
+| `fastapi` | `server.py` 的 HTTP 接口和请求体校验 |
+| `uvicorn` | 运行 `server:app` 的 ASGI 服务器 |
 
 ## 运行
 
@@ -49,9 +53,10 @@ python react_agent.py
 python search_agent.py
 python langgraph_agent.py
 python hitl_agent.py
+python -m uvicorn server:app --reload
 ```
 
-启动后在终端输入问题，输入 `q` 退出。
+六个脚本启动后在终端输入问题，输入 `q` 退出。`server.py` 监听 `http://127.0.0.1:8000`，交互文档在 `http://127.0.0.1:8000/docs`。用 `python -m uvicorn` 可以走当前虚拟环境里的解释器。
 
 可以试这些问法：
 
@@ -61,6 +66,7 @@ python hitl_agent.py
 - `search_agent.py`：`今天有什么科技新闻`
 - `langgraph_agent.py`：`查一下今天的科技新闻，再把搜索结果条数乘以 2`
 - `hitl_agent.py`：`帮我给 boss@example.com 发一封邮件，主题是周报，内容是本周工作已完成`
+- `server.py`：先对 `/chat` 发同样的发信请求，拿到 `waiting_approval` 后再对 `/chat/resume` 提交「确认」
 
 `react_agent.py` 和 `search_agent.py` 会在终端打印每一步调用的工具名、参数和观察结果。搜索结果较长，终端只显示前 200 个字符，完整内容仍会回传给模型。`langgraph_agent.py` 只打印最终回答。`hitl_agent.py` 在发信前打印确认问题，回复后再打印最终回答。
 
@@ -112,13 +118,68 @@ flowchart LR
 
 计算、查时间和搜索不会暂停。确认发生在工具函数内部，模型只要调用了 `send_email` 就会被拦住。
 
+## 同一张图的 HTTP 接口
+
+`agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具、`agent` / `tools` 循环，以及模块级的 `InMemorySaver`。`server.py` 在启动时导入这份已经编译好的图，自己不维护消息列表。检查点仍在进程内存里，服务重启后对话和停在半路的确认都会消失。
+
+`POST /chat` 的地址是 `http://127.0.0.1:8000/chat`。请求体：
+
+```json
+{
+  "thread_id": "thread-1",
+  "message": "帮我给 boss@example.com 发一封邮件，主题是周报，内容是本周工作已完成"
+}
+```
+
+`thread_id` 对应检查点里的一条对话。同一个 id 会接上已有历史；换一个 id 就是新对话。图跑完后接口再读一次 `graph.get_state`。停在 `send_email` 的 `interrupt()` 时返回：
+
+```json
+{
+  "status": "waiting_approval",
+  "approval": {
+    "question": "确认发送邮件给 boss@example.com？",
+    "to": "boss@example.com",
+    "subject": "周报",
+    "body": "本周工作已完成"
+  }
+}
+```
+
+没有暂停时返回最后一条消息，例如问「现在几点？」：
+
+```json
+{
+  "status": "completed",
+  "reply": "现在是 2026-10-07 19:00:00。"
+}
+```
+
+审批用 `POST http://127.0.0.1:8000/chat/resume`，`thread_id` 必须和暂停时的那次请求相同：
+
+```json
+{
+  "thread_id": "thread-1",
+  "decision": "确认"
+}
+```
+
+`decision` 会回到 `interrupt()` 的返回值。内容恰好是「确认」时，`send_email` 返回已发送；其他文字返回未发送。计算、查时间和搜索在 `/chat` 里就会返回 `completed`，不会停下来等 `/chat/resume`。
+
+PowerShell 里可以这样发起一轮普通对话：
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType "application/json" -Body '{"thread_id":"thread-1","message":"现在几点？"}'
+```
+
+CORS 允许任意来源，浏览器里的前端可以直接调用这两个接口。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
+
 ## 工具
 
 | 名称 | 作用 | 出现在 |
 | --- | --- | --- |
-| `calculator` | 计算数学表达式 | 全部脚本 |
-| `get_current_time` | 返回本地时间，格式 `YYYY-MM-DD HH:MM:SS` | `multi_tool.py` 及之后 |
-| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要 | `search_agent.py`、`langgraph_agent.py`、`hitl_agent.py` |
-| `send_email` | 模拟发信。执行前暂停，只有回复「确认」才返回已发送 | `hitl_agent.py` |
+| `calculator` | 计算数学表达式 | 全部脚本，以及 `agent_core.py` |
+| `get_current_time` | 返回本地时间，格式 `YYYY-MM-DD HH:MM:SS` | `multi_tool.py` 及之后的脚本，以及 `agent_core.py` |
+| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要 | `search_agent.py`、`langgraph_agent.py`、`hitl_agent.py`、`agent_core.py` |
+| `send_email` | 模拟发信。执行前暂停，只有回复「确认」才返回已发送 | `hitl_agent.py`、`agent_core.py` |
 
 `calculator` 使用去掉内置函数的 `eval` 计算表达式，只适合本地演示，不要把它暴露给不受信任的输入。

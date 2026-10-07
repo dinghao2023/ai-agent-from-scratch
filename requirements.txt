@@ -4,3 +4,5 @@ ddgs==9.16.0
 langchain-openai==1.6.7
 langgraph==1.2.12
 rich==15.0.0
+fastapi==0.142.2
+uvicorn==0.54.0
