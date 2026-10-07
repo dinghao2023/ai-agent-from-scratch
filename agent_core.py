@@ -8,7 +8,7 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import InMemorySaver
+# from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt
 from typing import Annotated
 from typing_extensions import TypedDict
@@ -70,9 +70,8 @@ graph_builder.add_edge(START, "agent")
 graph_builder.add_conditional_edges("agent", tools_condition)
 graph_builder.add_edge("tools", "agent")
 
-# 模块级单例：服务全程复用同一个 graph 和 checkpointer
-checkpointer = InMemorySaver()
-graph = graph_builder.compile(checkpointer=checkpointer)
+def build_graph(checkpointer):
+    return graph_builder.compile(checkpointer=checkpointer)
 
 def make_config(thread_id: str):
     return {"configurable": {"thread_id": thread_id}}
