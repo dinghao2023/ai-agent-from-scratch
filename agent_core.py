@@ -31,8 +31,11 @@ def get_current_time() -> str:
 @tool
 def web_search(query: str) -> str:
     """联网搜索实时信息，新闻、最新事件时使用"""
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=5))
+    try:
+        with DDGS(timeout=20) as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+    except Exception as e:
+        return f"搜索失败: {e}"
     if not results:
         return "没有搜索到相关结果"
     return "\n\n".join(f"标题：{r['title']}\n摘要：{r['body']}" for r in results)
