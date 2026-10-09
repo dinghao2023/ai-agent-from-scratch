@@ -14,8 +14,10 @@
 | `search_agent.py` | 在多步循环上增加 DuckDuckGo 搜索，用于新闻和实时信息。 |
 | `langgraph_agent.py` | 用 LangGraph 表达同一套工具循环：`agent` 调模型，`tools` 执行函数，条件边决定继续还是结束。 |
 | `hitl_agent.py` | 在同一张图上增加人工确认。`send_email` 执行前暂停，终端回复「确认」后才继续；同一次运行内用 `thread_id` 记住对话。 |
-| `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态、`InMemorySaver` 和 `thread_id` 配置集中在这里，进程内只编译一次。 |
-| `server.py` | FastAPI 服务。`POST /chat` 写入用户消息并跑图，`POST /chat/resume` 把审批决定送回暂停点。 |
+| `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态和 `build_graph` 在这里。检查点由调用方传入。 |
+| `database.py` | `app.db` 的异步引擎。启动时按模型建表。 |
+| `models.py` | `conversations` 和 `messages` 两张表，用 `thread_id` 对应一条可展示的会话。 |
+| `server.py` | FastAPI 服务。`POST /chat` 跑图，`POST /chat/resume` 提交审批，`GET /sessions/{thread_id}/messages` 按页读取已保存的消息。 |
 
 ## 环境
 
@@ -39,10 +41,14 @@ copy .env.example .env
 | `python-dotenv` | 从 `.env` 读取密钥 |
 | `ddgs` | DuckDuckGo 搜索 |
 | `langchain-openai` | `langgraph_agent.py`、`hitl_agent.py`、`agent_core.py` 里的 `ChatOpenAI` |
-| `langgraph` | 状态图、`ToolNode`、`tools_condition`，以及暂停恢复用的 `InMemorySaver` |
+| `langgraph` | 状态图、`ToolNode`、`tools_condition`。`hitl_agent.py` 用内存检查点 `InMemorySaver` |
+| `langgraph-checkpoint-sqlite` | `server.py` 把图状态写入 `checkpoints.db`，重启后还能继续未完成的审批 |
 | `rich` | `hitl_agent.py` 用来打印模型回复 |
 | `fastapi` | `server.py` 的 HTTP 接口和请求体校验 |
 | `uvicorn` | 运行 `server:app` 的 ASGI 服务器 |
+| `sqlalchemy` | `app.db` 里的会话和消息表 |
+| `aiosqlite` | SQLAlchemy 异步访问 SQLite，也是 SQLite 检查点的依赖 |
+| `greenlet` | SQLAlchemy 异步引擎需要它。缺少时导入 `sqlalchemy.ext.asyncio` 会失败 |
 
 ## 运行
 
@@ -120,7 +126,14 @@ flowchart LR
 
 ## 同一张图的 HTTP 接口
 
-`agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具、`agent` / `tools` 循环，以及模块级的 `InMemorySaver`。`server.py` 在启动时导入这份已经编译好的图，自己不维护消息列表。检查点仍在进程内存里，服务重启后对话和停在半路的确认都会消失。
+`agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具和 `agent` / `tools` 循环。它不自己创建检查点，只提供 `build_graph(checkpointer)`。`server.py` 启动时做两件事：`init_db()` 在 `app.db` 里建业务表，然后用 `AsyncSqliteSaver` 打开 `checkpoints.db` 并编译图。
+
+这两个文件都是 SQLite 数据库，服务跑起来之后出现在项目目录里：
+
+| 文件 | 内容 |
+| --- | --- |
+| `checkpoints.db` | 图的现场。完整消息、当前停在哪个节点、待审批的邮件。服务重启后，同一个 `thread_id` 还能接着跑。 |
+| `app.db` | 给前端看的记录。`conversations` 用唯一的 `thread_id` 对应一条会话，`messages` 存 `user` 和 `assistant` 文本。 |
 
 `POST /chat` 的地址是 `http://127.0.0.1:8000/chat`。请求体：
 
@@ -131,7 +144,11 @@ flowchart LR
 }
 ```
 
-`thread_id` 对应检查点里的一条对话。同一个 id 会接上已有历史；换一个 id 就是新对话。图跑完后接口再读一次 `graph.get_state`。停在 `send_email` 的 `interrupt()` 时返回：
+`thread_id` 同时对应 `checkpoints.db` 里的一条图状态和 `app.db` 里的一条会话。同一个 id 会接上已有历史；换一个 id 就是新对话。
+
+调用 `/chat` 时，如果这条线程还停在审批上，接口直接返回下面的 `waiting_approval`，不会把新消息写进图，也不会写进 `app.db`。如果检查点里有一次工具调用缺少工具结果，接口会先删掉从那条助手消息到末尾的记录，再继续这次请求。
+
+否则先把用户消息写入 `app.db`，再 `ainvoke`。图跑完后再读一次状态。停在 `send_email` 的 `interrupt()` 时返回：
 
 ```json
 {
@@ -163,7 +180,24 @@ flowchart LR
 }
 ```
 
-`decision` 会回到 `interrupt()` 的返回值。内容恰好是「确认」时，`send_email` 返回已发送；其他文字返回未发送。计算、查时间和搜索在 `/chat` 里就会返回 `completed`，不会停下来等 `/chat/resume`。
+`decision` 会回到 `interrupt()` 的返回值。内容恰好是「确认」时，`send_email` 返回已发送；其他文字返回未发送。计算、查时间和搜索在 `/chat` 里就会返回 `completed`，不会停下来等 `/chat/resume`。搜索超时或失败时，`web_search` 把原因写成文本交回模型，接口仍返回 `completed`。
+
+只有状态是 `completed` 时，最后一条回复才会写入 `app.db` 的 `messages`，角色是 `assistant`。停在审批期间，库里只有用户那条，没有助手回复。
+
+已保存的消息用 `GET http://127.0.0.1:8000/sessions/thread-1/messages?page=1&page_size=20` 读取。默认第 1 页、每页 20 条，按时间正序返回：
+
+```json
+{
+  "thread_id": "thread-1",
+  "page": 1,
+  "page_size": 20,
+  "total": 2,
+  "items": [
+    {"role": "user", "content": "现在几点？", "created_at": "2026-10-08 18:00:00"},
+    {"role": "assistant", "content": "现在是 2026-10-08 18:00:00。", "created_at": "2026-10-08 18:00:01"}
+  ]
+}
+```
 
 PowerShell 里可以这样发起一轮普通对话：
 
@@ -171,7 +205,7 @@ PowerShell 里可以这样发起一轮普通对话：
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType "application/json" -Body '{"thread_id":"thread-1","message":"现在几点？"}'
 ```
 
-CORS 允许任意来源，浏览器里的前端可以直接调用这两个接口。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
+CORS 允许任意来源，浏览器里的前端可以直接调用 `/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages`。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
 
 ## 工具
 
@@ -179,7 +213,7 @@ CORS 允许任意来源，浏览器里的前端可以直接调用这两个接口
 | --- | --- | --- |
 | `calculator` | 计算数学表达式 | 全部脚本，以及 `agent_core.py` |
 | `get_current_time` | 返回本地时间，格式 `YYYY-MM-DD HH:MM:SS` | `multi_tool.py` 及之后的脚本，以及 `agent_core.py` |
-| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要 | `search_agent.py`、`langgraph_agent.py`、`hitl_agent.py`、`agent_core.py` |
+| `web_search` | 用 DuckDuckGo 搜索，取前 5 条标题和摘要。`agent_core.py` 里等待 20 秒，失败时返回「搜索失败」，不把异常抛出请求 | `search_agent.py`、`langgraph_agent.py`、`hitl_agent.py`、`agent_core.py` |
 | `send_email` | 模拟发信。执行前暂停，只有回复「确认」才返回已发送 | `hitl_agent.py`、`agent_core.py` |
 
 `calculator` 使用去掉内置函数的 `eval` 计算表达式，只适合本地演示，不要把它暴露给不受信任的输入。

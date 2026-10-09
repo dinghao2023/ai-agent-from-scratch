@@ -8,6 +8,12 @@ env/
 .env.*
 !.env.example
 
+# 运行时数据库
+app.db
+checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
+
 # Python 缓存与编译产物
 __pycache__/
 *.py[cod]
