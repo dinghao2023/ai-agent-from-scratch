@@ -1,4 +1,4 @@
-import os
+# import os
 from datetime import datetime
 from dotenv import load_dotenv
 from ddgs import DDGS
@@ -13,7 +13,9 @@ from langgraph.types import interrupt
 from typing import Annotated
 from typing_extensions import TypedDict
 
-load_dotenv()
+from config import settings
+
+# load_dotenv()
 
 @tool
 def calculator(expression: str) ->str:
@@ -55,7 +57,7 @@ tools = [calculator, get_current_time, web_search, send_email]
 
 llm = ChatOpenAI(
     model="deepseek-chat",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    api_key=settings.deepseek_api_key,
     base_url="https://api.deepseek.com",
 )
 llm_with_tools = llm.bind_tools(tools)

@@ -14,10 +14,12 @@
 | `search_agent.py` | 在多步循环上增加 DuckDuckGo 搜索，用于新闻和实时信息。 |
 | `langgraph_agent.py` | 用 LangGraph 表达同一套工具循环：`agent` 调模型，`tools` 执行函数，条件边决定继续还是结束。 |
 | `hitl_agent.py` | 在同一张图上增加人工确认。`send_email` 执行前暂停，终端回复「确认」后才继续；同一次运行内用 `thread_id` 记住对话。 |
-| `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态和 `build_graph` 在这里。检查点由调用方传入。 |
+| `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态和 `build_graph` 在这里。检查点由调用方传入，DeepSeek 密钥从 `config.py` 读取。 |
+| `config.py` | 启动时从 `.env` 读取 `DEEPSEEK_API_KEY` 和 `APP_API_KEY`。 |
+| `deps.py` | 校验请求头 `X-API-Key`。三个 HTTP 接口共用这一道检查。 |
 | `database.py` | `app.db` 的异步引擎。启动时按模型建表。 |
 | `models.py` | `conversations` 和 `messages` 两张表，用 `thread_id` 对应一条可展示的会话。 |
-| `server.py` | FastAPI 服务。`POST /chat` 跑图，`POST /chat/resume` 提交审批，`GET /sessions/{thread_id}/messages` 按页读取已保存的消息。 |
+| `server.py` | FastAPI 服务。`POST /chat` 跑图，`POST /chat/resume` 提交审批，`GET /sessions/{thread_id}/messages` 按页读取已保存的消息。三个接口都要带 `X-API-Key`。 |
 
 ## 环境
 
@@ -31,7 +33,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-把 `.env` 里的 `DEEPSEEK_API_KEY` 换成自己的密钥。`.env` 已被 `.gitignore` 忽略，`.env.example` 只保留变量名。
+把 `.env` 里的 `DEEPSEEK_API_KEY` 换成自己的密钥，再设一个 `APP_API_KEY`。调用下面三个接口时，请求头要带 `X-API-Key`，值和 `APP_API_KEY` 相同。没写 `APP_API_KEY` 时，服务使用 `config.py` 里的默认值 `dev-secret-key`。`.env` 里多出来的变量会被忽略。`.env` 已被 `.gitignore` 忽略，`.env.example` 只保留变量名。
 
 `requirements.txt` 里的直接依赖：
 
@@ -49,6 +51,7 @@ copy .env.example .env
 | `sqlalchemy` | `app.db` 里的会话和消息表 |
 | `aiosqlite` | SQLAlchemy 异步访问 SQLite，也是 SQLite 检查点的依赖 |
 | `greenlet` | SQLAlchemy 异步引擎需要它。缺少时导入 `sqlalchemy.ext.asyncio` 会失败 |
+| `pydantic-settings` | `config.py` 从 `.env` 读取密钥。缺少时导入 `server.py` 会失败 |
 
 ## 运行
 
@@ -126,7 +129,9 @@ flowchart LR
 
 ## 同一张图的 HTTP 接口
 
-`agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具和 `agent` / `tools` 循环。它不自己创建检查点，只提供 `build_graph(checkpointer)`。`server.py` 启动时做两件事：`init_db()` 在 `app.db` 里建业务表，然后用 `AsyncSqliteSaver` 打开 `checkpoints.db` 并编译图。
+`agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具和 `agent` / `tools` 循环。它不自己创建检查点，只提供 `build_graph(checkpointer)`。DeepSeek 密钥来自 `config.py`，不再在这个文件里调用 `load_dotenv()`。`server.py` 启动时做两件事：`init_db()` 在 `app.db` 里建业务表，然后用 `AsyncSqliteSaver` 打开 `checkpoints.db` 并编译图。启动和关闭会在终端打一行日志。
+
+`/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages` 都先经过 `deps.py` 里的钥匙检查。请求头缺少 `X-API-Key`，或值和 `APP_API_KEY` 不一致时，接口返回 401，正文是 `{"detail": "无效或缺失的 API Key"}`。没有被单独处理的异常会把完整堆栈写进服务日志，调用方只看到状态码 500 和 `{"detail": "服务器内部错误"}`。
 
 这两个文件都是 SQLite 数据库，服务跑起来之后出现在项目目录里：
 
@@ -146,9 +151,7 @@ flowchart LR
 
 `thread_id` 同时对应 `checkpoints.db` 里的一条图状态和 `app.db` 里的一条会话。同一个 id 会接上已有历史；换一个 id 就是新对话。
 
-调用 `/chat` 时，如果这条线程还停在审批上，接口直接返回下面的 `waiting_approval`，不会把新消息写进图，也不会写进 `app.db`。如果检查点里有一次工具调用缺少工具结果，接口会先删掉从那条助手消息到末尾的记录，再继续这次请求。
-
-否则先把用户消息写入 `app.db`，再 `ainvoke`。图跑完后再读一次状态。停在 `send_email` 的 `interrupt()` 时返回：
+`/chat` 先把用户消息写入 `app.db`，再 `ainvoke`。图跑完后再读一次状态。停在 `send_email` 的 `interrupt()` 时返回：
 
 ```json
 {
@@ -199,13 +202,13 @@ flowchart LR
 }
 ```
 
-PowerShell 里可以这样发起一轮普通对话：
+PowerShell 里可以这样发起一轮普通对话。把 `X-API-Key` 换成 `.env` 里的 `APP_API_KEY`：
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType "application/json" -Body '{"thread_id":"thread-1","message":"现在几点？"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType "application/json" -Headers @{"X-API-Key"="dev-secret-key"} -Body '{"thread_id":"thread-1","message":"现在几点？"}'
 ```
 
-CORS 允许任意来源，浏览器里的前端可以直接调用 `/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages`。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
+CORS 允许任意来源和请求头，浏览器里的前端可以调用 `/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages`，同样要带 `X-API-Key`。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
 
 ## 工具
 
