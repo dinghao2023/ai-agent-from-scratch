@@ -16,10 +16,11 @@
 | `hitl_agent.py` | 在同一张图上增加人工确认。`send_email` 执行前暂停，终端回复「确认」后才继续；同一次运行内用 `thread_id` 记住对话。 |
 | `agent_core.py` | 供 `server.py` 导入的图。四个工具、状态和 `build_graph` 在这里。检查点由调用方传入，DeepSeek 密钥从 `config.py` 读取。 |
 | `config.py` | 启动时从 `.env` 读取 `DEEPSEEK_API_KEY` 和 `APP_API_KEY`。 |
-| `deps.py` | 校验请求头 `X-API-Key`。三个 HTTP 接口共用这一道检查。 |
+| `deps.py` | 校验请求头 `X-API-Key`。四个 HTTP 接口共用这一道检查。 |
 | `database.py` | `app.db` 的异步引擎。启动时按模型建表。 |
 | `models.py` | `conversations` 和 `messages` 两张表，用 `thread_id` 对应一条可展示的会话。 |
-| `server.py` | FastAPI 服务。`POST /chat` 跑图，`POST /chat/resume` 提交审批，`GET /sessions/{thread_id}/messages` 按页读取已保存的消息。三个接口都要带 `X-API-Key`。 |
+| `server.py` | FastAPI 服务。`POST /chat` 一次性返回，`POST /chat/stream` 按字推送，`POST /chat/resume` 提交审批，`GET /sessions/{thread_id}/messages` 按页读取已保存的消息。四个接口都要带 `X-API-Key`。 |
+| `stream_test.html` | 浏览器里调用 `/chat/stream` 的测试页。收到一段文字就追加一段，用来看打字机效果。 |
 
 ## 环境
 
@@ -33,7 +34,7 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-把 `.env` 里的 `DEEPSEEK_API_KEY` 换成自己的密钥，再设一个 `APP_API_KEY`。调用下面三个接口时，请求头要带 `X-API-Key`，值和 `APP_API_KEY` 相同。没写 `APP_API_KEY` 时，服务使用 `config.py` 里的默认值 `dev-secret-key`。`.env` 里多出来的变量会被忽略。`.env` 已被 `.gitignore` 忽略，`.env.example` 只保留变量名。
+把 `.env` 里的 `DEEPSEEK_API_KEY` 换成自己的密钥，再设一个 `APP_API_KEY`。调用下面四个接口时，请求头要带 `X-API-Key`，值和 `APP_API_KEY` 相同。没写 `APP_API_KEY` 时，服务使用 `config.py` 里的默认值 `dev-secret-key`。`.env` 里多出来的变量会被忽略。`.env` 已被 `.gitignore` 忽略，`.env.example` 只保留变量名。
 
 `requirements.txt` 里的直接依赖：
 
@@ -46,7 +47,7 @@ copy .env.example .env
 | `langgraph` | 状态图、`ToolNode`、`tools_condition`。`hitl_agent.py` 用内存检查点 `InMemorySaver` |
 | `langgraph-checkpoint-sqlite` | `server.py` 把图状态写入 `checkpoints.db`，重启后还能继续未完成的审批 |
 | `rich` | `hitl_agent.py` 用来打印模型回复 |
-| `fastapi` | `server.py` 的 HTTP 接口和请求体校验 |
+| `fastapi` | `server.py` 的 HTTP 接口、请求体校验，以及 `/chat/stream` 用的 `StreamingResponse`。流式输出没有额外的包 |
 | `uvicorn` | 运行 `server:app` 的 ASGI 服务器 |
 | `sqlalchemy` | `app.db` 里的会话和消息表 |
 | `aiosqlite` | SQLAlchemy 异步访问 SQLite，也是 SQLite 检查点的依赖 |
@@ -75,7 +76,7 @@ python -m uvicorn server:app --reload
 - `search_agent.py`：`今天有什么科技新闻`
 - `langgraph_agent.py`：`查一下今天的科技新闻，再把搜索结果条数乘以 2`
 - `hitl_agent.py`：`帮我给 boss@example.com 发一封邮件，主题是周报，内容是本周工作已完成`
-- `server.py`：先对 `/chat` 发同样的发信请求，拿到 `waiting_approval` 后再对 `/chat/resume` 提交「确认」
+- `server.py`：先对 `/chat` 或 `/chat/stream` 发同样的发信请求，拿到 `waiting_approval` 后再对 `/chat/resume` 提交「确认」。不要把「确认」当作新消息发给 `/chat` 或 `/chat/stream`
 
 `react_agent.py` 和 `search_agent.py` 会在终端打印每一步调用的工具名、参数和观察结果。搜索结果较长，终端只显示前 200 个字符，完整内容仍会回传给模型。`langgraph_agent.py` 只打印最终回答。`hitl_agent.py` 在发信前打印确认问题，回复后再打印最终回答。
 
@@ -131,7 +132,7 @@ flowchart LR
 
 `agent_core.py` 把 `hitl_agent.py` 里的图抽出来：四个工具和 `agent` / `tools` 循环。它不自己创建检查点，只提供 `build_graph(checkpointer)`。DeepSeek 密钥来自 `config.py`，不再在这个文件里调用 `load_dotenv()`。`server.py` 启动时做两件事：`init_db()` 在 `app.db` 里建业务表，然后用 `AsyncSqliteSaver` 打开 `checkpoints.db` 并编译图。启动和关闭会在终端打一行日志。
 
-`/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages` 都先经过 `deps.py` 里的钥匙检查。请求头缺少 `X-API-Key`，或值和 `APP_API_KEY` 不一致时，接口返回 401，正文是 `{"detail": "无效或缺失的 API Key"}`。没有被单独处理的异常会把完整堆栈写进服务日志，调用方只看到状态码 500 和 `{"detail": "服务器内部错误"}`。
+`/chat`、`/chat/stream`、`/chat/resume` 和 `/sessions/{thread_id}/messages` 都先经过 `deps.py` 里的钥匙检查。请求头缺少 `X-API-Key`，或值和 `APP_API_KEY` 不一致时，接口返回 401，正文是 `{"detail": "无效或缺失的 API Key"}`。没有被单独处理的异常会把完整堆栈写进服务日志，调用方只看到状态码 500 和 `{"detail": "服务器内部错误"}`。`/chat/stream` 如果已经开始往外推文字，中途出错时连接会直接断开，调用方收不到这条 JSON。
 
 这两个文件都是 SQLite 数据库，服务跑起来之后出现在项目目录里：
 
@@ -183,9 +184,11 @@ flowchart LR
 }
 ```
 
-`decision` 会回到 `interrupt()` 的返回值。内容恰好是「确认」时，`send_email` 返回已发送；其他文字返回未发送。计算、查时间和搜索在 `/chat` 里就会返回 `completed`，不会停下来等 `/chat/resume`。搜索超时或失败时，`web_search` 把原因写成文本交回模型，接口仍返回 `completed`。
+`decision` 会回到 `interrupt()` 的返回值。内容恰好是「确认」时，`send_email` 返回已发送；其他文字（包括「确认发送」）返回未发送。计算、查时间和搜索在 `/chat` 里就会返回 `completed`，不会停下来等 `/chat/resume`。搜索超时或失败时，`web_search` 把原因写成文本交回模型，接口仍返回 `completed`。
 
-只有状态是 `completed` 时，最后一条回复才会写入 `app.db` 的 `messages`，角色是 `assistant`。停在审批期间，库里只有用户那条，没有助手回复。
+图停在审批上时，检查点里是一条带工具调用、但还没有工具结果的助手消息。这时再对同一个 `thread_id` 调用 `/chat` 或 `/chat/stream`，等于在工具结果前面又插了一句用户消息，DeepSeek 会返回 400。批准或取消都走 `/chat/resume`。
+
+`/chat` 和 `/chat/resume` 只有状态是 `completed` 时，才把最后一条回复写入 `app.db` 的 `messages`，角色是 `assistant`。停在审批期间，库里只有用户那条，没有助手回复。
 
 已保存的消息用 `GET http://127.0.0.1:8000/sessions/thread-1/messages?page=1&page_size=20` 读取。默认第 1 页、每页 20 条，按时间正序返回：
 
@@ -202,13 +205,35 @@ flowchart LR
 }
 ```
 
+## 按字推送
+
+`POST /chat/stream` 的地址是 `http://127.0.0.1:8000/chat/stream`，请求体和 `/chat` 相同。响应类型是 `text/event-stream`：浏览器只发一次请求，服务每生成一小段就推一条，每条以 `data: ` 开头，用空行隔开。
+
+只推 `agent` 节点正在写的正文。工具调用、工具结果不会出现在流里。搜索或计算执行期间，页面上的字会停一会儿，工具结束后模型继续写，字再出现。
+
+正常结束时，最后一条是：
+
+```text
+data: {"event": "done"}
+```
+
+服务把已经推出去的文字拼成一整段，写入 `app.db` 的 `assistant` 消息。停在发信审批时不存助手回复，最后一条是：
+
+```text
+data: {"event": "waiting_approval", "approval": {"question": "确认发送邮件给 boss@example.com？", "to": "boss@example.com", "subject": "周报", "body": "本周工作已完成"}}
+```
+
+模型在调用发信工具之前如果已经写过几句说明，那些字会先推到浏览器，但审批期间不会写入 `app.db`。
+
+`stream_test.html` 用浏览器直接打开即可，服务需要已经在 `127.0.0.1:8000` 上运行。页面里写死了钥匙 `my-secret-key-123` 和会话 `stream-1`，要和 `.env` 里的 `APP_API_KEY` 一致。它只调用 `/chat/stream`，输入框里的「确认」不会完成审批。
+
 PowerShell 里可以这样发起一轮普通对话。把 `X-API-Key` 换成 `.env` 里的 `APP_API_KEY`：
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType "application/json" -Headers @{"X-API-Key"="dev-secret-key"} -Body '{"thread_id":"thread-1","message":"现在几点？"}'
 ```
 
-CORS 允许任意来源和请求头，浏览器里的前端可以调用 `/chat`、`/chat/resume` 和 `/sessions/{thread_id}/messages`，同样要带 `X-API-Key`。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
+CORS 允许任意来源和请求头，浏览器里的前端可以调用 `/chat`、`/chat/stream`、`/chat/resume` 和 `/sessions/{thread_id}/messages`，同样要带 `X-API-Key`。服务没有根路径，打开 `http://127.0.0.1:8000/` 会返回 404。
 
 ## 工具
 

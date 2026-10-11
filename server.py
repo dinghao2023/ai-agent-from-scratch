@@ -1,9 +1,10 @@
+import json
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +85,13 @@ async def get_or_create_conversation(db: AsyncSession, thread_id: str) -> Conver
     return conv
 
 
+async def save_user_message(thread_id: str, content: str):
+    async with SessionLocal() as db:
+        conv = await get_or_create_conversation(db, thread_id)
+        db.add(Message(conversation_id=conv.id, role="user", content=content))
+        await db.commit()
+
+
 async def save_assistant_reply(thread_id: str, content: str):
     async with SessionLocal() as db:
         conv = await get_or_create_conversation(db, thread_id)
@@ -100,20 +108,14 @@ async def chat(
 ):
     graph = request.app.state.graph
 
-    # 1. 存用户消息
-    async with SessionLocal() as db:
-        conv = await get_or_create_conversation(db, req.thread_id)
-        db.add(Message(conversation_id=conv.id, role="user", content=req.message))
-        await db.commit()
+    await save_user_message(req.thread_id, req.message)
 
-    # 2. 跑 Agent
     await graph.ainvoke(
         {"messages": [("user", req.message)]},
         make_config(req.thread_id),
     )
     result = await describe_state(graph, req.thread_id)
 
-    # 3. 跑完（非暂停）才存 AI 回复
     if result["status"] == "completed":
         await save_assistant_reply(req.thread_id, result["reply"])
     return result
@@ -145,13 +147,11 @@ async def get_messages(
     async with SessionLocal() as db:
         conv = await get_or_create_conversation(db, thread_id)
 
-        # 总数
         count_result = await db.execute(
             select(Message).where(Message.conversation_id == conv.id)
         )
         total = len(count_result.scalars().all())
 
-        # 当前页（最新在前）
         result = await db.execute(
             select(Message)
             .where(Message.conversation_id == conv.id)
@@ -168,6 +168,51 @@ async def get_messages(
         "total": total,
         "items": [
             {"role": m.role, "content": m.content, "created_at": str(m.created_at)}
-            for m in reversed(rows)  # 展示时翻回时间正序
+            for m in reversed(rows)
         ],
     }
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    req: ChatRequest,
+    request: Request,
+    _key: str = Depends(verify_api_key),
+):
+    graph = request.app.state.graph
+    await save_user_message(req.thread_id, req.message)
+
+    async def event_generator():
+        full_reply = ""
+        # stream_mode="messages"：模型每吐一点就 yield 一次
+        async for msg, metadata in graph.astream(
+            {"messages": [("user", req.message)]},
+            make_config(req.thread_id),
+            stream_mode="messages",
+        ):
+            # 只推 agent 节点产出的文字 token
+            if (
+                msg.type == "AIMessageChunk"
+                and msg.content
+                and metadata.get("langgraph_node") == "agent"
+            ):
+                full_reply += msg.content
+                yield f"data: {json.dumps({'token': msg.content}, ensure_ascii=False)}\n\n"
+
+        # 流结束，判断是正常完成还是撞上等审批
+        state = await graph.aget_state(make_config(req.thread_id))
+        if state.tasks and state.tasks[0].interrupts:
+            payload = json.dumps(
+                {
+                    "event": "waiting_approval",
+                    "approval": state.tasks[0].interrupts[0].value,
+                },
+                ensure_ascii=False,
+            )
+            yield f"data: {payload}\n\n"
+        else:
+            if full_reply:
+                await save_assistant_reply(req.thread_id, full_reply)
+            yield f"data: {json.dumps({'event': 'done'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
